@@ -3,16 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hemant.doomsday-wallpaper</string>
-
+    <string>io.github.doomsday-wallpaper</string>
     <key>ProgramArguments</key>
     <array>
         <string>__BINARY_PATH__</string>
     </array>
-
     <key>RunAtLoad</key>
     <true/>
-
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -20,11 +17,9 @@
         <key>Minute</key>
         <integer>5</integer>
     </dict>
-
     <key>StandardOutPath</key>
-    <string>/tmp/com.hemant.doomsday-wallpaper.log</string>
-
+    <string>/tmp/doomsday-wallpaper.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/com.hemant.doomsday-wallpaper.error.log</string>
+    <string>/tmp/doomsday-wallpaper.error.log</string>
 </dict>
 </plist>

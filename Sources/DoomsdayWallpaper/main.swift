@@ -1,9 +1,15 @@
 import AppKit
-import CoreGraphics
 import Foundation
+
+private struct AppConfiguration: Codable {
+    let targetDate: String
+    let startDate: String
+    let title: String
+}
 
 private struct CountdownProgress {
     let targetDate: Date
+    let title: String
     let totalDays: Int
     let elapsedDays: Int
     let remainingDays: Int
@@ -12,8 +18,8 @@ private struct CountdownProgress {
     let daysLeft: Int
 
     var percentComplete: Int {
-        guard totalDays > 0 else { return 0 }
-        return min(100, Int((Double(elapsedDays) / Double(totalDays) * 100.0).rounded(.down)))
+        guard totalDays > 0 else { return 100 }
+        return min(100, Int((Double(elapsedDays) / Double(totalDays) * 100).rounded(.down)))
     }
 }
 
@@ -21,15 +27,18 @@ private enum WallpaperError: LocalizedError {
     case noScreens
     case cannotCreateBitmap
     case cannotEncodePNG
+    case missingConfiguration
+    case invalidDate(String)
+    case targetNotFuture(String)
 
     var errorDescription: String? {
         switch self {
-        case .noScreens:
-            return "No active displays were found."
-        case .cannotCreateBitmap:
-            return "Could not create the wallpaper image buffer."
-        case .cannotEncodePNG:
-            return "Could not encode the wallpaper as PNG."
+        case .noScreens: return "No active displays were found."
+        case .cannotCreateBitmap: return "Could not create the wallpaper image buffer."
+        case .cannotEncodePNG: return "Could not encode the wallpaper as PNG."
+        case .missingConfiguration: return "No countdown is configured. Run configure.sh with a target date first."
+        case .invalidDate(let value): return "Invalid date '\(value)'. Use YYYY-MM-DD, for example 2030-01-01."
+        case .targetNotFuture(let value): return "Target date \(value) must be later than today."
         }
     }
 }
@@ -40,35 +49,81 @@ private var calendar: Calendar = {
     return value
 }()
 
-private func countdownProgress(now: Date = Date()) -> CountdownProgress {
+private let supportDirectory = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/DoomsdayWallpaper", isDirectory: true)
+private let configurationURL = supportDirectory.appendingPathComponent("config.json")
+
+private func makeDateFormatter() -> DateFormatter {
+    let formatter = DateFormatter()
+    formatter.calendar = calendar
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = calendar.timeZone
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.isLenient = false
+    return formatter
+}
+
+private func parseDate(_ value: String) throws -> Date {
+    let formatter = makeDateFormatter()
+    guard let date = formatter.date(from: value), formatter.string(from: date) == value else {
+        throw WallpaperError.invalidDate(value)
+    }
+    return calendar.startOfDay(for: date)
+}
+
+private func saveConfiguration(targetDate: String, title: String) throws {
+    let target = try parseDate(targetDate)
+    let today = calendar.startOfDay(for: Date())
+    guard target > today else { throw WallpaperError.targetNotFuture(targetDate) }
+
+    let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let configuration = AppConfiguration(
+        targetDate: targetDate,
+        startDate: makeDateFormatter().string(from: today),
+        title: cleanTitle.isEmpty ? "COUNTDOWN" : cleanTitle
+    )
+
+    try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(configuration).write(to: configurationURL, options: .atomic)
+    print("Configured '\(configuration.title)' for \(configuration.targetDate)")
+}
+
+private func loadConfiguration() throws -> AppConfiguration {
+    guard FileManager.default.fileExists(atPath: configurationURL.path) else {
+        throw WallpaperError.missingConfiguration
+    }
+    return try JSONDecoder().decode(AppConfiguration.self, from: Data(contentsOf: configurationURL))
+}
+
+private func countdownProgress(configuration: AppConfiguration, now: Date = Date()) throws -> CountdownProgress {
     let today = calendar.startOfDay(for: now)
-    let startDate = calendar.date(from: DateComponents(year: 2026, month: 9, day: 14))!
-    let targetDate = calendar.date(from: DateComponents(year: 2028, month: 9, day: 13))!
+    let startDate = try parseDate(configuration.startDate)
+    let targetDate = try parseDate(configuration.targetDate)
     let totalDays = max(1, calendar.dateComponents([.day], from: startDate, to: targetDate).day ?? 1)
     let rawElapsed = calendar.dateComponents([.day], from: startDate, to: today).day ?? 0
     let elapsedDays = min(totalDays, max(0, rawElapsed))
     let remainingDays = max(0, calendar.dateComponents([.day], from: today, to: targetDate).day ?? 0)
 
-    let calendarLeft: DateComponents
-    if today < targetDate {
-        calendarLeft = calendar.dateComponents([.year, .month, .day], from: today, to: targetDate)
-    } else {
-        calendarLeft = DateComponents(year: 0, month: 0, day: 0)
-    }
+    let components = today < targetDate
+        ? calendar.dateComponents([.year, .month, .day], from: today, to: targetDate)
+        : DateComponents(year: 0, month: 0, day: 0)
 
     return CountdownProgress(
         targetDate: targetDate,
+        title: configuration.title,
         totalDays: totalDays,
         elapsedDays: elapsedDays,
         remainingDays: remainingDays,
-        yearsLeft: calendarLeft.year ?? 0,
-        monthsLeft: calendarLeft.month ?? 0,
-        daysLeft: calendarLeft.day ?? 0
+        yearsLeft: components.year ?? 0,
+        monthsLeft: components.month ?? 0,
+        daysLeft: components.day ?? 0
     )
 }
 
 private func displayPixelSize(for screen: NSScreen) -> CGSize {
-    let scale = max(screen.backingScaleFactor, 1.0)
+    let scale = max(screen.backingScaleFactor, 1)
     return CGSize(
         width: max(1, (screen.frame.width * scale).rounded()),
         height: max(1, (screen.frame.height * scale).rounded())
@@ -85,27 +140,31 @@ private func drawCenteredText(
 ) {
     let paragraph = NSMutableParagraphStyle()
     paragraph.alignment = .center
-
     let attributes: [NSAttributedString.Key: Any] = [
         .font: font,
         .foregroundColor: color,
         .paragraphStyle: paragraph,
         .kern: tracking
     ]
-
     let attributed = NSAttributedString(string: text, attributes: attributes)
     let size = attributed.size()
     attributed.draw(in: NSRect(x: 0, y: y - size.height / 2, width: canvasWidth, height: size.height + 8))
 }
 
-private func renderWallpaper(size: CGSize, progress: CountdownProgress) throws -> Data {
-    let width = Int(size.width)
-    let height = Int(size.height)
+private func gridDimensions(totalDots: Int, availableSize: CGSize) -> (columns: Int, rows: Int, gap: CGFloat) {
+    let aspect = max(0.5, availableSize.width / availableSize.height)
+    let columns = max(1, min(totalDots, Int(ceil(sqrt(Double(totalDots) * Double(aspect))))))
+    let rows = max(1, Int(ceil(Double(totalDots) / Double(columns))))
+    let horizontalGap = columns > 1 ? availableSize.width / CGFloat(columns - 1) : availableSize.width
+    let verticalGap = rows > 1 ? availableSize.height / CGFloat(rows - 1) : availableSize.height
+    return (columns, rows, min(horizontalGap, verticalGap))
+}
 
+private func renderWallpaper(size: CGSize, progress: CountdownProgress) throws -> Data {
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
-        pixelsWide: width,
-        pixelsHigh: height,
+        pixelsWide: Int(size.width),
+        pixelsHigh: Int(size.height),
         bitsPerSample: 8,
         samplesPerPixel: 4,
         hasAlpha: true,
@@ -121,28 +180,27 @@ private func renderWallpaper(size: CGSize, progress: CountdownProgress) throws -
     NSGraphicsContext.current = graphics
     graphics.imageInterpolation = .high
 
-    let canvas = NSRect(x: 0, y: 0, width: size.width, height: size.height)
     NSColor(calibratedWhite: 0.008, alpha: 1).setFill()
-    canvas.fill()
+    NSRect(origin: .zero, size: size).fill()
 
-    let referenceScale = min(size.width / 2560.0, size.height / 1664.0)
-    let columns = 30
-    let rows = Int(ceil(Double(progress.totalDays) / Double(columns)))
-    let gap = max(19.0, 24.0 * referenceScale)
-    let radius = max(4.5, 5.8 * referenceScale)
-    let gridWidth = CGFloat(columns - 1) * gap
-    let gridHeight = CGFloat(rows - 1) * gap
+    let referenceScale = min(size.width / 2560, size.height / 1664)
+    let availableGridSize = CGSize(width: size.width * 0.58, height: size.height * 0.46)
+    let grid = gridDimensions(totalDots: progress.totalDays, availableSize: availableGridSize)
+    let gap = min(grid.gap, max(18, 25 * referenceScale))
+    let radius = max(1.4, min(6.2 * referenceScale, gap * 0.24))
+    let gridWidth = CGFloat(grid.columns - 1) * gap
+    let gridHeight = CGFloat(grid.rows - 1) * gap
     let gridStartX = (size.width - gridWidth) / 2
     let gridCenterY = size.height * 0.52
     let gridTopY = gridCenterY + gridHeight / 2
 
-    let completedColor = NSColor(calibratedWhite: 0.28, alpha: 0.72)
-    let futureColor = NSColor(calibratedRed: 1.0, green: 0.47, blue: 0.02, alpha: 0.82)
-    let todayColor = NSColor(calibratedWhite: 1.0, alpha: 1.0)
+    let elapsedColor = NSColor(calibratedWhite: 0.28, alpha: 0.72)
+    let remainingColor = NSColor(calibratedRed: 1, green: 0.47, blue: 0.02, alpha: 0.84)
+    let todayColor = NSColor(calibratedWhite: 1, alpha: 1)
 
     for index in 0..<progress.totalDays {
-        let row = index / columns
-        let column = index % columns
+        let row = index / grid.columns
+        let column = index % grid.columns
         let center = NSPoint(
             x: gridStartX + CGFloat(column) * gap,
             y: gridTopY - CGFloat(row) * gap
@@ -150,47 +208,53 @@ private func renderWallpaper(size: CGSize, progress: CountdownProgress) throws -
 
         let dotRadius: CGFloat
         let dotColor: NSColor
-
         if index < progress.elapsedDays {
             dotRadius = radius
-            dotColor = completedColor
+            dotColor = elapsedColor
         } else if index == progress.elapsedDays && progress.remainingDays > 0 {
             dotRadius = radius * 1.55
             dotColor = todayColor
         } else {
             dotRadius = radius
-            dotColor = futureColor
+            dotColor = remainingColor
         }
 
         dotColor.setFill()
-        NSBezierPath(
-            ovalIn: NSRect(
-                x: center.x - dotRadius,
-                y: center.y - dotRadius,
-                width: dotRadius * 2,
-                height: dotRadius * 2
-            )
-        ).fill()
+        NSBezierPath(ovalIn: NSRect(
+            x: center.x - dotRadius,
+            y: center.y - dotRadius,
+            width: dotRadius * 2,
+            height: dotRadius * 2
+        )).fill()
     }
 
-    let accent = NSColor(calibratedRed: 1.0, green: 0.52, blue: 0.04, alpha: 1.0)
-    let summaryFont = NSFont.monospacedSystemFont(ofSize: max(28, 35 * referenceScale), weight: .semibold)
-    let yearFont = NSFont.monospacedSystemFont(ofSize: max(12, 15 * referenceScale), weight: .medium)
+    let accent = NSColor(calibratedRed: 1, green: 0.52, blue: 0.04, alpha: 1)
+    let titleFont = NSFont.monospacedSystemFont(ofSize: max(14, 17 * referenceScale), weight: .semibold)
+    let dateFont = NSFont.monospacedSystemFont(ofSize: max(11, 14 * referenceScale), weight: .medium)
+    let summaryFont = NSFont.monospacedSystemFont(ofSize: max(27, 35 * referenceScale), weight: .semibold)
+    let detailFont = NSFont.monospacedSystemFont(ofSize: max(11, 14 * referenceScale), weight: .regular)
 
-    let targetFormatter = DateFormatter()
-    targetFormatter.calendar = calendar
-    targetFormatter.locale = Locale(identifier: "en_US_POSIX")
-    targetFormatter.dateFormat = "dd MMMM yyyy"
+    let displayDateFormatter = DateFormatter()
+    displayDateFormatter.calendar = calendar
+    displayDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+    displayDateFormatter.dateFormat = "d MMMM yyyy"
 
     drawCenteredText(
-        "UNTIL  \(targetFormatter.string(from: progress.targetDate).uppercased())",
-        atY: gridTopY + max(46, 58 * referenceScale),
+        progress.title.uppercased(),
+        atY: gridTopY + max(70, 88 * referenceScale),
         canvasWidth: size.width,
-        font: yearFont,
-        color: NSColor(calibratedWhite: 0.55, alpha: 0.9),
+        font: titleFont,
+        color: NSColor(calibratedWhite: 0.9, alpha: 0.96),
         tracking: 4 * referenceScale
     )
-
+    drawCenteredText(
+        "UNTIL  \(displayDateFormatter.string(from: progress.targetDate).uppercased())",
+        atY: gridTopY + max(43, 55 * referenceScale),
+        canvasWidth: size.width,
+        font: dateFont,
+        color: NSColor(calibratedWhite: 0.52, alpha: 0.9),
+        tracking: 3 * referenceScale
+    )
     drawCenteredText(
         "\(progress.yearsLeft)Y  ·  \(progress.monthsLeft)M  ·  \(progress.daysLeft)D  LEFT",
         atY: gridTopY - gridHeight - max(58, 72 * referenceScale),
@@ -199,9 +263,16 @@ private func renderWallpaper(size: CGSize, progress: CountdownProgress) throws -
         color: accent,
         tracking: 0.5 * referenceScale
     )
+    drawCenteredText(
+        "\(progress.remainingDays) DAYS REMAINING  ·  \(progress.percentComplete)% ELAPSED",
+        atY: gridTopY - gridHeight - max(94, 116 * referenceScale),
+        canvasWidth: size.width,
+        font: detailFont,
+        color: NSColor(calibratedWhite: 0.48, alpha: 0.88),
+        tracking: 1.5 * referenceScale
+    )
 
     NSGraphicsContext.restoreGraphicsState()
-
     guard let png = bitmap.representation(using: .png, properties: [:]) else {
         throw WallpaperError.cannotEncodePNG
     }
@@ -212,18 +283,10 @@ private func setWallpaper() throws {
     _ = NSApplication.shared
     let screens = NSScreen.screens
     guard !screens.isEmpty else { throw WallpaperError.noScreens }
+    try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
 
-    let outputDirectory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/DoomsdayWallpaper", isDirectory: true)
-    try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-
-    let progress = countdownProgress()
-    let filenameFormatter = DateFormatter()
-    filenameFormatter.calendar = calendar
-    filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
-    filenameFormatter.timeZone = calendar.timeZone
-    filenameFormatter.dateFormat = "yyyy-MM-dd-HHmmss"
-    let refreshID = filenameFormatter.string(from: Date())
+    let progress = try countdownProgress(configuration: loadConfiguration())
+    let refreshID = UUID().uuidString.lowercased()
     let options: [NSWorkspace.DesktopImageOptionKey: Any] = [
         .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
         .allowClipping: false,
@@ -231,22 +294,49 @@ private func setWallpaper() throws {
     ]
 
     for (index, screen) in screens.enumerated() {
-        // A unique URL is intentional: macOS caches desktop images by path and may
-        // continue displaying stale pixels when an existing PNG is overwritten.
-        let outputURL = outputDirectory.appendingPathComponent(
-            "wallpaper-display-\(index + 1)-\(refreshID).png"
-        )
-        let png = try renderWallpaper(size: displayPixelSize(for: screen), progress: progress)
-        try png.write(to: outputURL, options: .atomic)
+        let outputURL = supportDirectory.appendingPathComponent("wallpaper-display-\(index + 1)-\(refreshID).png")
+        try renderWallpaper(size: displayPixelSize(for: screen), progress: progress)
+            .write(to: outputURL, options: .atomic)
         try NSWorkspace.shared.setDesktopImageURL(outputURL, for: screen, options: options)
         print("Set display \(index + 1): \(outputURL.path)")
     }
 
-    print("Countdown to 13 September 2028: \(progress.yearsLeft)y \(progress.monthsLeft)m \(progress.daysLeft)d (\(progress.remainingDays) total days) left")
+    print("\(progress.title): \(progress.yearsLeft)y \(progress.monthsLeft)m \(progress.daysLeft)d (\(progress.remainingDays) days) left")
+}
+
+private func printUsage() {
+    print("""
+    Doomsday Wallpaper
+
+    Usage:
+      doomsday-wallpaper                         Refresh the wallpaper
+      doomsday-wallpaper --configure DATE TITLE  Set a new countdown
+      doomsday-wallpaper --help                  Show this help
+
+    DATE must use YYYY-MM-DD format. TITLE is optional.
+    """)
 }
 
 do {
-    try setWallpaper()
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    if arguments.first == "--help" || arguments.first == "-h" {
+        printUsage()
+    } else if arguments.first == "--configure" {
+        guard arguments.count >= 2 else {
+            printUsage()
+            throw WallpaperError.invalidDate("")
+        }
+        try saveConfiguration(
+            targetDate: arguments[1],
+            title: arguments.count >= 3 ? arguments[2] : "COUNTDOWN"
+        )
+        try setWallpaper()
+    } else if arguments.isEmpty {
+        try setWallpaper()
+    } else {
+        printUsage()
+        exit(2)
+    }
 } catch {
     FileHandle.standardError.write(Data("Doomsday Wallpaper: \(error.localizedDescription)\n".utf8))
     exit(1)
